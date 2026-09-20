@@ -1,0 +1,27 @@
+# Rust build output and generated benchmark reports
+/target/
+
+# .NET build output
+**/bin/
+**/obj/
+
+# Generated benchmark data and local reports
+/criterion/
+/bench-results/
+
+# Local editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+*.swp
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+
+# Coverage and profiling output
+/coverage/
+*.profraw
+*.profdata
+.freebuff/
