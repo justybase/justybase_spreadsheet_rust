@@ -3,8 +3,9 @@
 # so this crate publishes as `justybase-spreadsheet`. The library target keeps
 # the short name, so `use spreadsheet::...` keeps working.
 name = "justybase-spreadsheet"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
+rust-version = "1.88"
 license = "MIT"
 authors = ["Krzysztof Duśko <krzysztof@justybase.com>"]
 repository = "https://github.com/justybase/justybase_spreadsheet_rust"
@@ -28,10 +29,10 @@ path = "src/lib.rs"
 
 [dependencies]
 atoi_simd = "0.18"
-zip = "2"
+zip = "8"
 chrono = "0.4"
 fast-float2 = "0.2"
-quick-xml = "0.41"
+quick-xml = "0.42"
 tempfile = "3"
 thiserror = "2"
 memchr = "2"
@@ -39,10 +40,14 @@ ryu = "1"
 itoa = "1"
 
 [dev-dependencies]
+# xlsb-writer 0.1.0 exposes Arrow 53 RecordBatch values; keeping the same
+# Arrow major here avoids duplicate/incompatible RecordBatch types in the
+# comparison example. This also constrains its chrono dependency to <0.4.40.
 arrow-array = "53"
 arrow-schema = "53"
+# Exact pin keeps the calamine cross-check/fingerprint benchmark reproducible.
 calamine = "=0.36.1"
-criterion = { version = "0.7", features = ["html_reports"] }
+criterion = "0.8"
 rust_xlsxwriter = { version = "0.99", features = ["chrono", "constant_memory"] }
 rxlsb = "0.3"
 tempfile = "3"

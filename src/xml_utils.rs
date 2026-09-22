@@ -95,14 +95,14 @@ pub fn uses_1904_date_system(xml: &str) -> bool {
     loop {
         match reader.read_event() {
             Ok(Event::Start(element)) | Ok(Event::Empty(element))
-                if element.local_name().as_ref() == b"workbookPr" =>
+                if element.local_name().as_ref() == "workbookPr" =>
             {
                 return element
                     .attributes()
                     .flatten()
                     .find_map(|attr| {
-                        (attr.key.local_name().as_ref() == b"date1904")
-                            .then(|| String::from_utf8_lossy(attr.value.as_ref()).into_owned())
+                        (attr.key.local_name().as_ref() == "date1904")
+                            .then(|| attr.value.to_string())
                     })
                     .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
             }
@@ -175,18 +175,18 @@ pub fn parse_shared_strings_xml(xml: &str) -> Vec<String> {
     let mut value = String::new();
     loop {
         match reader.read_event() {
-            Ok(Event::Start(element)) if element.local_name().as_ref() == b"si" => {
+            Ok(Event::Start(element)) if element.local_name().as_ref() == "si" => {
                 in_item = true;
                 in_text = false;
                 value.clear();
             }
-            Ok(Event::Start(element)) if in_item && element.local_name().as_ref() == b"t" => {
+            Ok(Event::Start(element)) if in_item && element.local_name().as_ref() == "t" => {
                 in_text = true;
             }
-            Ok(Event::End(element)) if element.local_name().as_ref() == b"t" => {
+            Ok(Event::End(element)) if element.local_name().as_ref() == "t" => {
                 in_text = false;
             }
-            Ok(Event::End(element)) if element.local_name().as_ref() == b"si" => {
+            Ok(Event::End(element)) if element.local_name().as_ref() == "si" => {
                 if in_item {
                     result.push(std::mem::take(&mut value));
                     in_item = false;
@@ -194,13 +194,13 @@ pub fn parse_shared_strings_xml(xml: &str) -> Vec<String> {
                 }
             }
             Ok(Event::Text(text)) if in_item && in_text => {
-                value.push_str(&String::from_utf8_lossy(text.as_ref()));
+                value.push_str(text.as_ref());
             }
             Ok(Event::GeneralRef(reference)) if in_item && in_text => {
                 value.push_str(&decode_xml_reference(reference.as_ref()));
             }
             Ok(Event::CData(text)) if in_item && in_text => {
-                value.push_str(&String::from_utf8_lossy(text.as_ref()));
+                value.push_str(text.as_ref());
             }
             Ok(Event::Eof) | Err(_) => break,
             _ => {}
@@ -209,8 +209,8 @@ pub fn parse_shared_strings_xml(xml: &str) -> Vec<String> {
     result
 }
 
-fn decode_xml_reference(reference: &[u8]) -> String {
-    let raw = format!("&{};", String::from_utf8_lossy(reference));
+fn decode_xml_reference(reference: &str) -> String {
+    let raw = format!("&{};", reference);
     quick_xml::escape::unescape(&raw)
         .map(|value| value.into_owned())
         .unwrap_or(raw)

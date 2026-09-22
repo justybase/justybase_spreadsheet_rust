@@ -249,18 +249,18 @@ impl XlsxReader {
                 .read_event_into(&mut self.row_buf)
                 .map_err(|e| SpreadsheetError::InvalidFormat(format!("XLSX XML: {e}")))?;
             match event {
-                Event::Start(element) if element.local_name().as_ref() == b"row" => {
+                Event::Start(element) if element.local_name().as_ref() == "row" => {
                     in_row = true;
                 }
-                Event::End(element) if element.local_name().as_ref() == b"row" => {
+                Event::End(element) if element.local_name().as_ref() == "row" => {
                     if in_row {
                         return Ok(true);
                     }
                 }
-                Event::Empty(element) if element.local_name().as_ref() == b"row" => {
+                Event::Empty(element) if element.local_name().as_ref() == "row" => {
                     return Ok(true);
                 }
-                Event::Start(element) if element.local_name().as_ref() == b"c" && in_row => {
+                Event::Start(element) if element.local_name().as_ref() == "c" && in_row => {
                     let (column, cell_type, style) = parse_cell_attributes(&element);
                     let context = XlsxParseContext {
                         shared_strings: &self.shared_strings,
@@ -288,7 +288,7 @@ impl XlsxReader {
                     self.current_row[col] = value;
                     self.field_count = self.field_count.max(col + 1);
                 }
-                Event::Empty(element) if element.local_name().as_ref() == b"c" && in_row => {
+                Event::Empty(element) if element.local_name().as_ref() == "c" && in_row => {
                     let (column, _, _) = parse_cell_attributes(&element);
                     let col = column.map(|value| value as usize).unwrap_or(next_col);
                     if col >= crate::EXCEL_MAX_COLUMNS {
@@ -325,7 +325,7 @@ impl XlsxReader {
 /// Streaming XLSX cell reader. The ZIP member and shared-string table are
 /// borrowed from the parent reader; no worksheet-wide XML buffer is created.
 pub struct XlsxCellReader<'a> {
-    xml: XmlReader<BufReader<ZipFile<'a>>>,
+    xml: XmlReader<BufReader<ZipFile<'a, File>>>,
     shared_strings: &'a [String],
     formats: &'a [u16],
     custom_date_formats: &'a HashSet<u16>,
@@ -340,7 +340,7 @@ pub struct XlsxCellReader<'a> {
 
 impl<'a> XlsxCellReader<'a> {
     fn new(
-        entry: ZipFile<'a>,
+        entry: ZipFile<'a, File>,
         shared_strings: &'a [String],
         formats: &'a [u16],
         custom_date_formats: &'a HashSet<u16>,
@@ -376,19 +376,19 @@ impl<'a> XlsxCellReader<'a> {
                     .read_event_into(&mut self.buf)
                     .map_err(|e| SpreadsheetError::InvalidFormat(format!("XLSX XML: {e}")))?;
                 match event {
-                    Event::Start(element) if element.local_name().as_ref() == b"row" => {
+                    Event::Start(element) if element.local_name().as_ref() == "row" => {
                         EventKind::Row(parse_row_number(&element))
                     }
-                    Event::End(element) if element.local_name().as_ref() == b"row" => {
+                    Event::End(element) if element.local_name().as_ref() == "row" => {
                         EventKind::EndRow
                     }
-                    Event::Start(element) if element.local_name().as_ref() == b"c" => {
+                    Event::Start(element) if element.local_name().as_ref() == "c" => {
                         EventKind::Cell(parse_cell_attributes(&element))
                     }
-                    Event::Empty(element) if element.local_name().as_ref() == b"c" => {
+                    Event::Empty(element) if element.local_name().as_ref() == "c" => {
                         EventKind::EmptyCell(parse_cell_attributes(&element).0)
                     }
-                    Event::End(element) if element.local_name().as_ref() == b"sheetData" => {
+                    Event::End(element) if element.local_name().as_ref() == "sheetData" => {
                         EventKind::EndSheet
                     }
                     Event::Eof => EventKind::Eof,
@@ -445,7 +445,7 @@ impl<'a> XlsxCellReader<'a> {
                 .read_event_into(&mut self.cell_buf)
                 .map_err(|e| SpreadsheetError::InvalidFormat(format!("XLSX cell XML: {e}")))?;
             match event {
-                Event::Start(element) if element.local_name().as_ref() == b"v" => {
+                Event::Start(element) if element.local_name().as_ref() == "v" => {
                     self.scratch.clear();
                     loop {
                         self.value_buf.clear();
@@ -464,7 +464,7 @@ impl<'a> XlsxCellReader<'a> {
                                 self.scratch
                                     .push_str(&decode_xml_reference(reference.as_ref()));
                             }
-                            Event::End(end) if end.local_name().as_ref() == b"v" => break,
+                            Event::End(end) if end.local_name().as_ref() == "v" => break,
                             Event::Eof => {
                                 return Err(SpreadsheetError::InvalidFormat(
                                     "unterminated XLSX value".into(),
@@ -489,11 +489,11 @@ impl<'a> XlsxCellReader<'a> {
                         other => other,
                     };
                 }
-                Event::Start(element) if element.local_name().as_ref() == b"is" => {
+                Event::Start(element) if element.local_name().as_ref() == "is" => {
                     self.read_inline_string()?;
                     value = ParsedCellValue::ScratchText;
                 }
-                Event::Start(element) if element.local_name().as_ref() == b"t" => {
+                Event::Start(element) if element.local_name().as_ref() == "t" => {
                     if cell_type == XlsxCellType::InlineString {
                         self.value_buf.clear();
                         if let Ok(Event::Text(text)) = self.xml.read_event_into(&mut self.value_buf)
@@ -503,7 +503,7 @@ impl<'a> XlsxCellReader<'a> {
                         }
                     }
                 }
-                Event::End(element) if element.local_name().as_ref() == b"c" => {
+                Event::End(element) if element.local_name().as_ref() == "c" => {
                     return Ok(match value {
                         ParsedCellValue::Empty => CellValueRef::Empty,
                         ParsedCellValue::SharedString(index) => self
@@ -522,7 +522,7 @@ impl<'a> XlsxCellReader<'a> {
                         }
                     });
                 }
-                Event::Empty(element) if element.local_name().as_ref() == b"c" => {
+                Event::Empty(element) if element.local_name().as_ref() == "c" => {
                     return Ok(CellValueRef::Empty)
                 }
                 Event::Eof => {
@@ -544,10 +544,10 @@ impl<'a> XlsxCellReader<'a> {
                 .read_event_into(&mut self.value_buf)
                 .map_err(|e| SpreadsheetError::InvalidFormat(format!("XLSX inline XML: {e}")))?;
             match event {
-                Event::Start(element) if element.local_name().as_ref() == b"t" => {
+                Event::Start(element) if element.local_name().as_ref() == "t" => {
                     in_text = true;
                 }
-                Event::End(element) if element.local_name().as_ref() == b"t" => {
+                Event::End(element) if element.local_name().as_ref() == "t" => {
                     in_text = false;
                 }
                 Event::Text(text) if in_text => {
@@ -560,7 +560,7 @@ impl<'a> XlsxCellReader<'a> {
                 Event::CData(text) if in_text => {
                     append_unescaped(&mut self.scratch, text.as_ref())?;
                 }
-                Event::End(element) if element.local_name().as_ref() == b"is" => return Ok(()),
+                Event::End(element) if element.local_name().as_ref() == "is" => return Ok(()),
                 Event::Eof => {
                     return Err(SpreadsheetError::InvalidFormat(
                         "unterminated inline string".into(),
@@ -597,18 +597,18 @@ fn read_owned_cell_value<R: BufRead>(
             .read_event_into(buf)
             .map_err(|e| SpreadsheetError::InvalidFormat(format!("XLSX cell XML: {e}")))?;
         match event {
-            Event::Start(element) if element.local_name().as_ref() == b"v" => {
+            Event::Start(element) if element.local_name().as_ref() == "v" => {
                 in_value = true;
                 value_text.clear();
             }
-            Event::Start(element) if element.local_name().as_ref() == b"is" => {
+            Event::Start(element) if element.local_name().as_ref() == "is" => {
                 inline_string = true;
                 in_text = false;
             }
-            Event::Start(element) if inline_string && element.local_name().as_ref() == b"t" => {
+            Event::Start(element) if inline_string && element.local_name().as_ref() == "t" => {
                 in_text = true;
             }
-            Event::End(element) if element.local_name().as_ref() == b"t" => {
+            Event::End(element) if element.local_name().as_ref() == "t" => {
                 in_text = false;
             }
             Event::Text(text) if in_value => {
@@ -620,7 +620,7 @@ fn read_owned_cell_value<R: BufRead>(
             Event::GeneralRef(reference) if in_value => {
                 value_text.push_str(&decode_xml_reference(reference.as_ref()));
             }
-            Event::End(element) if in_value && element.local_name().as_ref() == b"v" => {
+            Event::End(element) if in_value && element.local_name().as_ref() == "v" => {
                 parsed = parse_value(
                     value_text.as_bytes(),
                     cell_type,
@@ -636,7 +636,7 @@ fn read_owned_cell_value<R: BufRead>(
                     ParsedCellValue::OwnedText(value) => value,
                     _ => String::new(),
                 };
-                value.push_str(&String::from_utf8_lossy(text.as_ref()));
+                value.push_str(text.as_ref());
                 parsed = ParsedCellValue::OwnedText(value);
             }
             Event::CData(text) if inline_string && in_text => {
@@ -644,7 +644,7 @@ fn read_owned_cell_value<R: BufRead>(
                     ParsedCellValue::OwnedText(value) => value,
                     _ => String::new(),
                 };
-                value.push_str(&String::from_utf8_lossy(text.as_ref()));
+                value.push_str(text.as_ref());
                 parsed = ParsedCellValue::OwnedText(value);
             }
             Event::GeneralRef(reference) if inline_string && in_text => {
@@ -655,7 +655,7 @@ fn read_owned_cell_value<R: BufRead>(
                 value.push_str(&decode_xml_reference(reference.as_ref()));
                 parsed = ParsedCellValue::OwnedText(value);
             }
-            Event::End(element) if element.local_name().as_ref() == b"c" => {
+            Event::End(element) if element.local_name().as_ref() == "c" => {
                 return Ok(match parsed {
                     ParsedCellValue::Empty => CellValue::Empty,
                     ParsedCellValue::SharedString(index) => context
@@ -670,7 +670,7 @@ fn read_owned_cell_value<R: BufRead>(
                     ParsedCellValue::OwnedText(value) => CellValue::Text(value),
                 });
             }
-            Event::End(element) if element.local_name().as_ref() == b"is" => {
+            Event::End(element) if element.local_name().as_ref() == "is" => {
                 inline_string = false;
                 in_text = false;
             }
@@ -743,8 +743,8 @@ fn parse_row_number(element: &BytesStart<'_>) -> Option<u32> {
     element
         .attributes()
         .flatten()
-        .find(|attr| attr.key.as_ref() == b"r")
-        .and_then(|attr| parse_cell_reference(attr.value.as_ref()).map(|(row, _)| row))
+        .find(|attr| attr.key.as_ref() == "r")
+        .and_then(|attr| parse_cell_reference(attr.value.as_bytes()).map(|(row, _)| row))
 }
 
 fn parse_cell_attributes(element: &BytesStart<'_>) -> (Option<u32>, XlsxCellType, usize) {
@@ -753,15 +753,15 @@ fn parse_cell_attributes(element: &BytesStart<'_>) -> (Option<u32>, XlsxCellType
     let mut style = 0;
     for attr in element.attributes().flatten() {
         match attr.key.as_ref() {
-            b"r" => column = parse_cell_reference(attr.value.as_ref()).map(|(_, col)| col),
-            b"s" => {
-                style = atoi_simd::parse::<usize, true, false>(attr.value.as_ref()).unwrap_or(0)
+            "r" => column = parse_cell_reference(attr.value.as_bytes()).map(|(_, col)| col),
+            "s" => {
+                style = atoi_simd::parse::<usize, true, false>(attr.value.as_bytes()).unwrap_or(0)
             }
-            b"t" => {
+            "t" => {
                 cell_type = match attr.value.as_ref() {
-                    b"s" => XlsxCellType::SharedString,
-                    b"b" => XlsxCellType::Boolean,
-                    b"inlineStr" | b"inline_string" => XlsxCellType::InlineString,
+                    "s" => XlsxCellType::SharedString,
+                    "b" => XlsxCellType::Boolean,
+                    "inlineStr" | "inline_string" => XlsxCellType::InlineString,
                     _ => XlsxCellType::Other,
                 }
             }
@@ -771,15 +771,13 @@ fn parse_cell_attributes(element: &BytesStart<'_>) -> (Option<u32>, XlsxCellType
     (column, cell_type, style)
 }
 
-fn append_unescaped(scratch: &mut String, raw: &[u8]) -> SpreadsheetResult<()> {
-    let raw = std::str::from_utf8(raw)
-        .map_err(|e| SpreadsheetError::InvalidFormat(format!("invalid XLSX text: {e}")))?;
+fn append_unescaped(scratch: &mut String, raw: &str) -> SpreadsheetResult<()> {
     scratch.push_str(raw);
     Ok(())
 }
 
-fn decode_xml_reference(reference: &[u8]) -> String {
-    let raw = format!("&{};", String::from_utf8_lossy(reference));
+fn decode_xml_reference(reference: &str) -> String {
+    let raw = format!("&{};", reference);
     quick_xml::escape::unescape(&raw)
         .map(|value| value.into_owned())
         .unwrap_or(raw)
@@ -848,25 +846,20 @@ fn parse_sheet_entries(xml: &str) -> Vec<(String, String, String)> {
     loop {
         match reader.read_event() {
             Ok(Event::Start(element)) | Ok(Event::Empty(element))
-                if element.local_name().as_ref() == b"sheet" =>
+                if element.local_name().as_ref() == "sheet" =>
             {
                 let mut name = None;
                 let mut sheet_id = None;
                 let mut r_id = None;
                 for attribute in element.attributes().flatten() {
                     let value = attribute
-                        .decoded_and_normalized_value(
-                            quick_xml::XmlVersion::default(),
-                            reader.decoder(),
-                        )
+                        .normalized_value(quick_xml::XmlVersion::default())
                         .map(|value| value.into_owned())
-                        .unwrap_or_else(|_| {
-                            String::from_utf8_lossy(attribute.value.as_ref()).into_owned()
-                        });
+                        .unwrap_or_else(|_| attribute.value.to_string());
                     match attribute.key.local_name().as_ref() {
-                        b"name" => name = Some(value),
-                        b"sheetId" => sheet_id = Some(value),
-                        b"id" => r_id = Some(value),
+                        "name" => name = Some(value),
+                        "sheetId" => sheet_id = Some(value),
+                        "id" => r_id = Some(value),
                         _ => {}
                     }
                 }
@@ -891,22 +884,17 @@ fn parse_styles(xml: &str) -> (Vec<u16>, HashSet<u16>) {
         match reader.read_event() {
             Ok(Event::Start(element)) | Ok(Event::Empty(element)) => {
                 match element.local_name().as_ref() {
-                    b"numFmt" => {
+                    "numFmt" => {
                         let mut id = None;
                         let mut code = None;
                         for attribute in element.attributes().flatten() {
                             let value = attribute
-                                .decoded_and_normalized_value(
-                                    quick_xml::XmlVersion::default(),
-                                    reader.decoder(),
-                                )
+                                .normalized_value(quick_xml::XmlVersion::default())
                                 .map(|value| value.into_owned())
-                                .unwrap_or_else(|_| {
-                                    String::from_utf8_lossy(attribute.value.as_ref()).into_owned()
-                                });
+                                .unwrap_or_else(|_| attribute.value.to_string());
                             match attribute.key.as_ref() {
-                                b"numFmtId" => id = value.parse::<u16>().ok(),
-                                b"formatCode" => code = Some(value),
+                                "numFmtId" => id = value.parse::<u16>().ok(),
+                                "formatCode" => code = Some(value),
                                 _ => {}
                             }
                         }
@@ -916,14 +904,11 @@ fn parse_styles(xml: &str) -> (Vec<u16>, HashSet<u16>) {
                             }
                         }
                     }
-                    b"cellXfs" => in_cell_xfs = true,
-                    b"xf" if in_cell_xfs => {
+                    "cellXfs" => in_cell_xfs = true,
+                    "xf" if in_cell_xfs => {
                         for attribute in element.attributes().flatten() {
-                            if attribute.key.as_ref() == b"numFmtId" {
-                                if let Ok(id) = std::str::from_utf8(attribute.value.as_ref())
-                                    .unwrap_or_default()
-                                    .parse::<u16>()
-                                {
+                            if attribute.key.as_ref() == "numFmtId" {
+                                if let Ok(id) = attribute.value.parse::<u16>() {
                                     xfs.push(id);
                                 }
                             }
@@ -932,7 +917,7 @@ fn parse_styles(xml: &str) -> (Vec<u16>, HashSet<u16>) {
                     _ => {}
                 }
             }
-            Ok(Event::End(element)) if element.local_name().as_ref() == b"cellXfs" => {
+            Ok(Event::End(element)) if element.local_name().as_ref() == "cellXfs" => {
                 in_cell_xfs = false;
             }
             Ok(Event::Eof) | Err(_) => break,
