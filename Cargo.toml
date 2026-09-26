@@ -46,7 +46,7 @@ ouroboros = "0.18.5"
 # Arrow major here avoids duplicate/incompatible RecordBatch types in the
 # comparison example. This also constrains its chrono dependency to <0.4.40.
 arrow-array = "53"
-arrow-schema = "60"
+arrow-schema = "53"
 # Exact pin keeps the calamine cross-check/fingerprint benchmark reproducible.
 calamine = "=0.36.1"
 criterion = "0.8"
