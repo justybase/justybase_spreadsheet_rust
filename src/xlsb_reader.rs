@@ -10,8 +10,19 @@ use crate::formats::{CellRef, CellValue, CellValueRef};
 use crate::{datetime_from_excel_serial, datetime_from_oa_date, oa_epoch_naive};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::Read;
-use std::path::Path;
+use std::io::{BufReader, Read};
+use std::path::{Path, PathBuf};
+use zip::read::ZipFile;
+
+type XlsbStreamParser<'a> = BiffReaderWriter<'a, BufReader<ZipFile<'a, File>>>;
+
+#[ouroboros::self_referencing]
+struct XlsbSheetStream {
+    archive: zip::ZipArchive<File>,
+    #[borrows(mut archive)]
+    #[covariant]
+    reader: XlsbStreamParser<'this>,
+}
 
 struct SheetInfo {
     name: String,
@@ -21,14 +32,13 @@ struct SheetInfo {
 
 pub struct XlsbReader {
     zip: Option<zip::ZipArchive<File>>,
+    source_path: Option<PathBuf>,
     shared_strings: Vec<String>,
     sheet_names: Vec<String>,
     sheets: Vec<SheetInfo>,
 
     current_sheet_index: i64,
-    reader: Option<BiffReaderWriter<'static>>,
-    // Own the sheet bytes so the reader borrow is valid.
-    sheet_bytes: Vec<u8>,
+    reader: Option<XlsbSheetStream>,
     current_row: Vec<CellValue>,
     pending_row_index: i32,
     eof: bool,
@@ -48,12 +58,12 @@ impl XlsbReader {
     pub fn new() -> Self {
         Self {
             zip: None,
+            source_path: None,
             shared_strings: Vec::new(),
             sheet_names: Vec::new(),
             sheets: Vec::new(),
             current_sheet_index: -1,
             reader: None,
-            sheet_bytes: Vec::new(),
             current_row: Vec::new(),
             pending_row_index: -1,
             eof: false,
@@ -68,11 +78,9 @@ impl XlsbReader {
     }
 
     pub fn open(&mut self, path: &Path, read_shared_strings: bool) -> SpreadsheetResult<()> {
-        // Drop the reader before replacing the owned sheet buffer.  The
-        // reader contains a deliberately tied 'static borrow of that buffer.
         self.reader = None;
         self.zip = None;
-        self.sheet_bytes.clear();
+        self.source_path = None;
         self.shared_strings.clear();
         self.sheet_names.clear();
         self.sheets.clear();
@@ -127,23 +135,34 @@ impl XlsbReader {
         }
 
         if read_shared_strings {
-            if let Some(ss) = read_zip_entry(&mut zip, "xl/sharedStrings.bin")? {
-                let mut reader = BiffReaderWriter::new(&ss);
-                while reader.read_shared_strings()? {
-                    if let Some(v) = reader.shared_string_value.clone() {
-                        self.shared_strings.push(v);
+            match zip.by_name("xl/sharedStrings.bin") {
+                Ok(entry) => {
+                    let mut reader =
+                        BiffReaderWriter::from_reader(BufReader::with_capacity(64 * 1024, entry));
+                    while reader.read_shared_strings()? {
+                        if let Some(value) = reader.shared_string_value.take() {
+                            self.shared_strings.push(value);
+                        }
                     }
                 }
+                Err(zip::result::ZipError::FileNotFound) => {}
+                Err(error) => return Err(error.into()),
             }
         }
 
-        if let Some(styles) = read_zip_entry(&mut zip, "xl/styles.bin")? {
-            let mut reader = BiffReaderWriter::new(&styles);
-            while reader.read_styles()? {}
-            self.xf_id_to_num_fmt_id = reader.xf_index_to_num_fmt_id.clone();
-            self.custom_date_formats = reader.custom_num_fmts.clone();
+        match zip.by_name("xl/styles.bin") {
+            Ok(entry) => {
+                let mut reader =
+                    BiffReaderWriter::from_reader(BufReader::with_capacity(16 * 1024, entry));
+                while reader.read_styles()? {}
+                self.xf_id_to_num_fmt_id = reader.xf_index_to_num_fmt_id;
+                self.custom_date_formats = reader.custom_num_fmts;
+            }
+            Err(zip::result::ZipError::FileNotFound) => {}
+            Err(error) => return Err(error.into()),
         }
 
+        self.source_path = Some(path.canonicalize()?);
         self.zip = Some(zip);
         self.results_count = self.sheets.len();
         self.current_sheet_index = -1;
@@ -162,15 +181,19 @@ impl XlsbReader {
             .find(|sheet| sheet.name == name)
             .and_then(|sheet| sheet.path.clone())
             .ok_or_else(|| SpreadsheetError::SheetNotFound(name.to_owned()))?;
-        let bytes = read_zip_entry(
-            self.zip
-                .as_mut()
-                .ok_or_else(|| SpreadsheetError::InvalidFormat("reader is not open".into()))?,
-            &path,
-        )?
-        .ok_or_else(|| SpreadsheetError::InvalidFormat(format!("missing sheet part: {path}")))?;
+        let entry = self
+            .zip
+            .as_mut()
+            .ok_or_else(|| SpreadsheetError::InvalidFormat("reader is not open".into()))?
+            .by_name(&path)
+            .map_err(|error| match error {
+                zip::result::ZipError::FileNotFound => {
+                    SpreadsheetError::InvalidFormat(format!("missing sheet part: {path}"))
+                }
+                error => error.into(),
+            })?;
         XlsbCellReader::new(
-            bytes,
+            entry,
             &self.shared_strings,
             &self.xf_id_to_num_fmt_id,
             &self.custom_date_formats,
@@ -218,21 +241,21 @@ impl XlsbReader {
                 bool_value,
                 string_value,
             ) = match self.reader.as_mut() {
-                Some(r) => {
-                    let has = r.read_worksheet()?;
-                    (
+                Some(stream) => stream.with_reader_mut(|reader| {
+                    let has = reader.read_worksheet()?;
+                    Ok::<_, SpreadsheetError>((
                         has,
-                        r.row_index,
-                        r.read_cell,
-                        r.cell_type,
-                        r.column_num,
-                        r.xf_index,
-                        r.int_value,
-                        r.double_val,
-                        r.bool_value,
-                        r.string_value.clone(),
-                    )
-                }
+                        reader.row_index,
+                        reader.read_cell,
+                        reader.cell_type,
+                        reader.column_num,
+                        reader.xf_index,
+                        reader.int_value,
+                        reader.double_val,
+                        reader.bool_value,
+                        reader.string_value.take(),
+                    ))
+                })?,
                 None => return Ok(false),
             };
             if !has_record {
@@ -297,39 +320,47 @@ impl XlsbReader {
             return Ok(false);
         }
         self.reader = None;
-        self.sheet_bytes.clear();
         let path = self.sheets[index]
             .path
             .clone()
             .ok_or_else(|| SpreadsheetError::InvalidFormat("sheet has no resolved path".into()))?;
-        let bytes = read_zip_entry(
-            self.zip
-                .as_mut()
-                .ok_or_else(|| SpreadsheetError::InvalidFormat("reader is not open".into()))?,
-            &path,
-        )?
-        .ok_or_else(|| SpreadsheetError::InvalidFormat(format!("missing sheet part: {path}")))?;
+        let source_path = self
+            .source_path
+            .as_ref()
+            .ok_or_else(|| SpreadsheetError::InvalidFormat("reader is not open".into()))?;
+        let archive = zip::ZipArchive::new(File::open(source_path)?)?;
+        let sheet_path = path.clone();
+        let mut reader = XlsbSheetStreamTryBuilder {
+            archive,
+            reader_builder: |archive| {
+                let entry = archive.by_name(&sheet_path).map_err(|error| match error {
+                    zip::result::ZipError::FileNotFound => {
+                        SpreadsheetError::InvalidFormat(format!("missing sheet part: {sheet_path}"))
+                    }
+                    error => error.into(),
+                })?;
+                Ok::<_, SpreadsheetError>(BiffReaderWriter::from_reader(BufReader::with_capacity(
+                    64 * 1024,
+                    entry,
+                )))
+            },
+        }
+        .try_build()?;
         self.actual_sheet_name = self.sheets[index].name.clone();
-        self.sheet_bytes = bytes;
-        // SAFETY: `reader` borrows `sheet_bytes` which lives as long as
-        // `self` and is never reallocated while `reader` is alive
-        // (we always drop `reader` before touching `sheet_bytes`).
-        // We model this by transmuting to 'static and upholding the
-        // invariant manually in `init_sheet`/`close`.
-        let slice: &'static [u8] = unsafe { std::mem::transmute(self.sheet_bytes.as_slice()) };
-        let mut reader = BiffReaderWriter::new(slice);
         self.eof = false;
         self.pending_row_index = -1;
-        while reader.read_worksheet()? {
-            if reader.row_index != -1 {
-                self.pending_row_index = reader.row_index;
-                self.reader = Some(reader);
-                return Ok(true);
+        let available = reader.with_reader_mut(|parser| {
+            while parser.read_worksheet()? {
+                if parser.row_index != -1 {
+                    self.pending_row_index = parser.row_index;
+                    return Ok::<_, SpreadsheetError>(true);
+                }
             }
-        }
-        self.eof = true;
+            Ok(false)
+        })?;
+        self.eof = !available;
         self.reader = Some(reader);
-        Ok(false)
+        Ok(available)
     }
 
     fn select_sheet_index(&mut self, index: usize) -> SpreadsheetResult<bool> {
@@ -351,7 +382,6 @@ impl XlsbReader {
 
     pub fn close(&mut self) {
         self.reader = None;
-        self.sheet_bytes.clear();
         self.current_sheet_index = -1;
     }
 
@@ -391,8 +421,7 @@ fn read_zip_entry(
 
 /// Streaming XLSB cell reader backed by the BIFF12 worksheet decoder.
 pub struct XlsbCellReader<'a> {
-    reader: BiffReaderWriter<'static>,
-    _sheet_bytes: Vec<u8>,
+    reader: XlsbStreamParser<'a>,
     shared_strings: &'a [String],
     formats: &'a [u16],
     custom_date_formats: &'a HashSet<u16>,
@@ -404,16 +433,14 @@ pub struct XlsbCellReader<'a> {
 
 impl<'a> XlsbCellReader<'a> {
     fn new(
-        sheet_bytes: Vec<u8>,
+        entry: ZipFile<'a, File>,
         shared_strings: &'a [String],
         formats: &'a [u16],
         custom_date_formats: &'a HashSet<u16>,
         uses_1904_date_system: bool,
     ) -> SpreadsheetResult<Self> {
-        let slice: &'static [u8] = unsafe { std::mem::transmute(sheet_bytes.as_slice()) };
         Ok(Self {
-            reader: BiffReaderWriter::new(slice),
-            _sheet_bytes: sheet_bytes,
+            reader: BiffReaderWriter::from_reader(BufReader::with_capacity(64 * 1024, entry)),
             shared_strings,
             formats,
             custom_date_formats,

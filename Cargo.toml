@@ -3,7 +3,7 @@
 # so this crate publishes as `justybase-spreadsheet`. The library target keeps
 # the short name, so `use spreadsheet::...` keeps working.
 name = "justybase-spreadsheet"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
@@ -17,6 +17,7 @@ exclude = [
     "BENCHMARKS.md",
     "benches/**",
     "examples/parity_bench.rs",
+    "examples/read_scale_bench.rs",
     "examples/write_comparison.rs",
     "examples/xlsb_write_comparison.rs",
     "parity/bench_ts.ts",
@@ -38,6 +39,7 @@ thiserror = "2"
 memchr = "2"
 ryu = "1"
 itoa = "1"
+ouroboros = "0.18.5"
 
 [dev-dependencies]
 # xlsb-writer 0.1.0 exposes Arrow 53 RecordBatch values; keeping the same

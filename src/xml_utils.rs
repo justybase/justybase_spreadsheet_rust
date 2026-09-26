@@ -2,6 +2,7 @@
 
 use quick_xml::events::Event;
 use quick_xml::Reader as XmlReader;
+use std::io::BufRead;
 
 fn has_invalid_control_chars(s: &str) -> bool {
     for c in s.chars() {
@@ -209,6 +210,55 @@ pub fn parse_shared_strings_xml(xml: &str) -> Vec<String> {
     result
 }
 
+/// Parse a shared-string table directly from a buffered ZIP-entry reader.
+/// Unlike [`parse_shared_strings_xml`], this avoids first allocating the
+/// complete uncompressed XML part as a `String`.
+pub(crate) fn parse_shared_strings_xml_stream<R: BufRead>(
+    source: R,
+) -> Result<Vec<String>, quick_xml::Error> {
+    let mut reader = XmlReader::from_reader(source);
+    reader.config_mut().trim_text(false);
+    let mut result = Vec::new();
+    let mut buffer = Vec::with_capacity(1024);
+    let mut in_item = false;
+    let mut in_text = false;
+    let mut value = String::new();
+    loop {
+        buffer.clear();
+        match reader.read_event_into(&mut buffer)? {
+            Event::Start(element) if element.local_name().as_ref() == "si" => {
+                in_item = true;
+                in_text = false;
+                value.clear();
+            }
+            Event::Start(element) if in_item && element.local_name().as_ref() == "t" => {
+                in_text = true;
+            }
+            Event::End(element) if element.local_name().as_ref() == "t" => {
+                in_text = false;
+            }
+            Event::End(element) if element.local_name().as_ref() == "si" => {
+                if in_item {
+                    result.push(std::mem::take(&mut value));
+                    in_item = false;
+                    in_text = false;
+                }
+            }
+            Event::Text(text) if in_item && in_text => {
+                value.push_str(text.as_ref());
+            }
+            Event::GeneralRef(reference) if in_item && in_text => {
+                value.push_str(&decode_xml_reference(reference.as_ref()));
+            }
+            Event::CData(text) if in_item && in_text => {
+                value.push_str(text.as_ref());
+            }
+            Event::Eof => return Ok(result),
+            _ => {}
+        }
+    }
+}
+
 fn decode_xml_reference(reference: &str) -> String {
     let raw = format!("&{};", reference);
     quick_xml::escape::unescape(&raw)
@@ -403,5 +453,17 @@ mod tests {
     fn shared_strings_ignore_formatting_between_text_runs() {
         let xml = "<sst>\n  <si>\n    <r><rPr/><t>first</t></r>\n    <r><t>second</t></r>\n  </si>\n</sst>";
         assert_eq!(parse_shared_strings_xml(xml), vec!["firstsecond"]);
+    }
+
+    #[test]
+    fn streaming_shared_strings_match_string_parser() {
+        use std::io::Cursor;
+
+        let xml =
+            r#"<sst><si><t>R&amp;D</t></si><si><r><t>first</t></r><r><t>second</t></r></si></sst>"#;
+        assert_eq!(
+            parse_shared_strings_xml_stream(Cursor::new(xml.as_bytes())).unwrap(),
+            parse_shared_strings_xml(xml)
+        );
     }
 }

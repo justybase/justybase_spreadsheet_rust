@@ -7,13 +7,22 @@ use crate::error::{SpreadsheetError, SpreadsheetResult};
 use crate::formats::{is_date_format_code, CellValue, CellValueRef};
 use crate::xlsb_reader::parse_relationships;
 use crate::{datetime_from_excel_serial, xml_utils};
+use quick_xml::events::attributes::AttrError;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader as XmlReader;
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Cursor, Read};
-use std::path::Path;
+use std::io::{BufRead, BufReader, Read};
+use std::path::{Path, PathBuf};
 use zip::read::ZipFile;
+
+#[ouroboros::self_referencing]
+struct XlsxSheetStream {
+    archive: zip::ZipArchive<File>,
+    #[borrows(mut archive)]
+    #[covariant]
+    reader: XmlReader<BufReader<ZipFile<'this, File>>>,
+}
 
 struct SheetInfo {
     name: String,
@@ -26,12 +35,13 @@ struct SheetInfo {
 
 pub struct XlsxReader {
     zip: Option<zip::ZipArchive<File>>,
+    source_path: Option<PathBuf>,
     shared_strings: Vec<String>,
     sheet_names: Vec<String>,
     sheets: Vec<SheetInfo>,
 
     current_sheet_index: i64,
-    row_reader: Option<XmlReader<BufReader<Cursor<Vec<u8>>>>>,
+    row_reader: Option<XlsxSheetStream>,
     row_buf: Vec<u8>,
     current_row: Vec<CellValue>,
 
@@ -50,6 +60,7 @@ impl XlsxReader {
     pub fn new() -> Self {
         Self {
             zip: None,
+            source_path: None,
             shared_strings: Vec::new(),
             sheet_names: Vec::new(),
             sheets: Vec::new(),
@@ -69,6 +80,7 @@ impl XlsxReader {
 
     pub fn open(&mut self, path: &Path, read_shared_strings: bool) -> SpreadsheetResult<()> {
         self.zip = None;
+        self.source_path = None;
         self.shared_strings.clear();
         self.sheet_names.clear();
         self.sheets.clear();
@@ -114,9 +126,18 @@ impl XlsxReader {
         }
 
         if read_shared_strings {
-            if let Some(ss) = read_zip_entry(&mut zip, "xl/sharedStrings.xml")? {
-                let xml = String::from_utf8_lossy(&ss).into_owned();
-                self.shared_strings = xml_utils::parse_shared_strings_xml(&xml);
+            match zip.by_name("xl/sharedStrings.xml") {
+                Ok(entry) => {
+                    let source = BufReader::with_capacity(64 * 1024, entry);
+                    self.shared_strings = xml_utils::parse_shared_strings_xml_stream(source)
+                        .map_err(|error| {
+                            SpreadsheetError::InvalidFormat(format!(
+                                "XLSX shared strings XML: {error}"
+                            ))
+                        })?;
+                }
+                Err(zip::result::ZipError::FileNotFound) => {}
+                Err(error) => return Err(error.into()),
             }
         }
 
@@ -127,6 +148,7 @@ impl XlsxReader {
             self.custom_date_formats = customs;
         }
 
+        self.source_path = Some(path.canonicalize()?);
         self.zip = Some(zip);
         self.results_count = self.sheets.len();
         self.current_sheet_index = -1;
@@ -202,28 +224,27 @@ impl XlsxReader {
         }
         let sheet = &self.sheets[index];
         self.actual_sheet_name = sheet.name.clone();
-        let bytes = self
-            .zip
-            .as_mut()
-            .ok_or_else(|| SpreadsheetError::InvalidFormat("reader is not open".into()))?
-            .by_name(&sheet.path)
-            .map_err(|_| {
-                SpreadsheetError::InvalidFormat(format!("missing worksheet part: {}", sheet.path))
-            })
-            .and_then(|mut entry| {
-                let size = usize::try_from(entry.size()).map_err(|_| {
-                    SpreadsheetError::InvalidFormat(
-                        "ZIP entry is too large for this platform".into(),
-                    )
+        let path = self
+            .source_path
+            .as_ref()
+            .ok_or_else(|| SpreadsheetError::InvalidFormat("reader is not open".into()))?;
+        let archive = zip::ZipArchive::new(File::open(path)?)?;
+        let sheet_path = sheet.path.clone();
+        let row_reader = XlsxSheetStreamTryBuilder {
+            archive,
+            reader_builder: |archive| {
+                let entry = archive.by_name(&sheet_path).map_err(|error| {
+                    SpreadsheetError::InvalidFormat(format!(
+                        "missing worksheet part: {sheet_path} ({error})"
+                    ))
                 })?;
-                let mut bytes = Vec::with_capacity(size);
-                entry.read_to_end(&mut bytes)?;
-                Ok(bytes)
-            })?;
-        let mut reader =
-            XmlReader::from_reader(BufReader::with_capacity(64 * 1024, Cursor::new(bytes)));
-        reader.config_mut().trim_text(false);
-        self.row_reader = Some(reader);
+                let mut reader = XmlReader::from_reader(BufReader::with_capacity(64 * 1024, entry));
+                reader.config_mut().trim_text(false);
+                Ok::<_, SpreadsheetError>(reader)
+            },
+        }
+        .try_build()?;
+        self.row_reader = Some(row_reader);
         Ok(())
     }
 
@@ -238,74 +259,29 @@ impl XlsxReader {
 
     fn read_next_row(&mut self) -> SpreadsheetResult<bool> {
         self.current_row.clear();
-        let mut next_col = 0usize;
-        let mut in_row = false;
-        loop {
-            self.row_buf.clear();
-            let event = self
-                .row_reader
-                .as_mut()
-                .ok_or_else(|| SpreadsheetError::InvalidFormat("reader is not open".into()))?
-                .read_event_into(&mut self.row_buf)
-                .map_err(|e| SpreadsheetError::InvalidFormat(format!("XLSX XML: {e}")))?;
-            match event {
-                Event::Start(element) if element.local_name().as_ref() == "row" => {
-                    in_row = true;
-                }
-                Event::End(element) if element.local_name().as_ref() == "row" => {
-                    if in_row {
-                        return Ok(true);
-                    }
-                }
-                Event::Empty(element) if element.local_name().as_ref() == "row" => {
-                    return Ok(true);
-                }
-                Event::Start(element) if element.local_name().as_ref() == "c" && in_row => {
-                    let (column, cell_type, style) = parse_cell_attributes(&element);
-                    let context = XlsxParseContext {
-                        shared_strings: &self.shared_strings,
-                        formats: &self.xf_id_to_num_fmt_id,
-                        custom_date_formats: &self.custom_date_formats,
-                        uses_1904_date_system: self.uses_1904_date_system,
-                    };
-                    let value = read_owned_cell_value(
-                        self.row_reader.as_mut().expect("row reader exists"),
-                        &mut self.row_buf,
-                        cell_type,
-                        style,
-                        &context,
-                    )?;
-                    let col = column.map(|value| value as usize).unwrap_or(next_col);
-                    if col >= crate::EXCEL_MAX_COLUMNS {
-                        return Err(SpreadsheetError::InvalidFormat(
-                            "XLSX column index is outside Excel worksheet bounds".into(),
-                        ));
-                    }
-                    next_col = col + 1;
-                    if self.current_row.len() <= col {
-                        self.current_row.resize(col + 1, CellValue::Empty);
-                    }
-                    self.current_row[col] = value;
-                    self.field_count = self.field_count.max(col + 1);
-                }
-                Event::Empty(element) if element.local_name().as_ref() == "c" && in_row => {
-                    let (column, _, _) = parse_cell_attributes(&element);
-                    let col = column.map(|value| value as usize).unwrap_or(next_col);
-                    if col >= crate::EXCEL_MAX_COLUMNS {
-                        return Err(SpreadsheetError::InvalidFormat(
-                            "XLSX column index is outside Excel worksheet bounds".into(),
-                        ));
-                    }
-                    next_col = col + 1;
-                    if self.current_row.len() <= col {
-                        self.current_row.resize(col + 1, CellValue::Empty);
-                    }
-                    self.field_count = self.field_count.max(col + 1);
-                }
-                Event::Eof => return Ok(false),
-                _ => {}
-            }
-        }
+        let Self {
+            row_reader,
+            row_buf,
+            current_row,
+            field_count,
+            shared_strings,
+            xf_id_to_num_fmt_id,
+            custom_date_formats,
+            uses_1904_date_system,
+            ..
+        } = self;
+        let row_reader = row_reader
+            .as_mut()
+            .ok_or_else(|| SpreadsheetError::InvalidFormat("reader is not open".into()))?;
+        let context = XlsxParseContext {
+            shared_strings,
+            formats: xf_id_to_num_fmt_id,
+            custom_date_formats,
+            uses_1904_date_system: *uses_1904_date_system,
+        };
+        row_reader.with_reader_mut(|reader| {
+            read_next_row_from(reader, row_buf, current_row, field_count, &context)
+        })
     }
 
     pub fn get_value(&self, i: usize) -> CellValue {
@@ -319,6 +295,69 @@ impl XlsxReader {
     pub fn close(&mut self) {
         self.row_reader = None;
         self.current_sheet_index = -1;
+    }
+}
+
+fn read_next_row_from<R: BufRead>(
+    reader: &mut XmlReader<R>,
+    row_buf: &mut Vec<u8>,
+    current_row: &mut Vec<CellValue>,
+    field_count: &mut usize,
+    context: &XlsxParseContext<'_>,
+) -> SpreadsheetResult<bool> {
+    current_row.clear();
+    let mut next_col = 0usize;
+    let mut in_row = false;
+    loop {
+        row_buf.clear();
+        let event = reader
+            .read_event_into(row_buf)
+            .map_err(|error| SpreadsheetError::InvalidFormat(format!("XLSX XML: {error}")))?;
+        match event {
+            Event::Start(element) if element.local_name().as_ref() == "row" => {
+                in_row = true;
+            }
+            Event::End(element) if element.local_name().as_ref() == "row" => {
+                if in_row {
+                    return Ok(true);
+                }
+            }
+            Event::Empty(element) if element.local_name().as_ref() == "row" => {
+                return Ok(true);
+            }
+            Event::Start(element) if element.local_name().as_ref() == "c" && in_row => {
+                let (column, cell_type, style) = parse_cell_attributes(&element);
+                let value = read_owned_cell_value(reader, row_buf, cell_type, style, context)?;
+                let col = column.map(|value| value as usize).unwrap_or(next_col);
+                if col >= crate::EXCEL_MAX_COLUMNS {
+                    return Err(SpreadsheetError::InvalidFormat(
+                        "XLSX column index is outside Excel worksheet bounds".into(),
+                    ));
+                }
+                next_col = col + 1;
+                if current_row.len() <= col {
+                    current_row.resize(col + 1, CellValue::Empty);
+                }
+                current_row[col] = value;
+                *field_count = (*field_count).max(col + 1);
+            }
+            Event::Empty(element) if element.local_name().as_ref() == "c" && in_row => {
+                let (column, _, _) = parse_cell_attributes(&element);
+                let col = column.map(|value| value as usize).unwrap_or(next_col);
+                if col >= crate::EXCEL_MAX_COLUMNS {
+                    return Err(SpreadsheetError::InvalidFormat(
+                        "XLSX column index is outside Excel worksheet bounds".into(),
+                    ));
+                }
+                next_col = col + 1;
+                if current_row.len() <= col {
+                    current_row.resize(col + 1, CellValue::Empty);
+                }
+                *field_count = (*field_count).max(col + 1);
+            }
+            Event::Eof => return Ok(false),
+            _ => {}
+        }
     }
 }
 
@@ -447,47 +486,121 @@ impl<'a> XlsxCellReader<'a> {
             match event {
                 Event::Start(element) if element.local_name().as_ref() == "v" => {
                     self.scratch.clear();
-                    loop {
-                        self.value_buf.clear();
-                        let value_event =
-                            self.xml.read_event_into(&mut self.value_buf).map_err(|e| {
+                    self.value_buf.clear();
+                    let first_event =
+                        self.xml.read_event_into(&mut self.value_buf).map_err(|e| {
+                            SpreadsheetError::InvalidFormat(format!("XLSX value XML: {e}"))
+                        })?;
+
+                    // Most worksheet values are one plain text event followed by </v>.
+                    // Parse those directly from quick-xml's reusable byte buffer instead
+                    // of copying them into `scratch` first. Entity-bearing values and
+                    // text cells keep using the general decoding path below.
+                    let fast_cell_type = matches!(
+                        cell_type,
+                        XlsxCellType::Number | XlsxCellType::Boolean | XlsxCellType::SharedString
+                    );
+                    let fast_value = match &first_event {
+                        Event::Text(text) if fast_cell_type => {
+                            let text = text.as_ref();
+                            (!text.as_bytes().contains(&b'&')).then(|| {
+                                parse_value(
+                                    text.as_bytes(),
+                                    cell_type,
+                                    style,
+                                    formats,
+                                    custom_date_formats,
+                                    uses_1904_date_system,
+                                )
+                            })
+                        }
+                        Event::CData(text) if fast_cell_type => {
+                            let text = text.as_ref();
+                            (!text.as_bytes().contains(&b'&')).then(|| {
+                                parse_value(
+                                    text.as_bytes(),
+                                    cell_type,
+                                    style,
+                                    formats,
+                                    custom_date_formats,
+                                    uses_1904_date_system,
+                                )
+                            })
+                        }
+                        _ => None,
+                    }
+                    .transpose()?;
+
+                    if let Some(parsed) = fast_value {
+                        self.cell_buf.clear();
+                        let next_event =
+                            self.xml.read_event_into(&mut self.cell_buf).map_err(|e| {
                                 SpreadsheetError::InvalidFormat(format!("XLSX value XML: {e}"))
                             })?;
-                        match value_event {
-                            Event::Text(text) => {
-                                append_unescaped(&mut self.scratch, text.as_ref())?;
+                        match next_event {
+                            Event::End(end) if end.local_name().as_ref() == "v" => {
+                                value = parsed;
+                                continue;
                             }
-                            Event::CData(text) => {
-                                append_unescaped(&mut self.scratch, text.as_ref())?;
-                            }
-                            Event::GeneralRef(reference) => {
-                                self.scratch
-                                    .push_str(&decode_xml_reference(reference.as_ref()));
-                            }
-                            Event::End(end) if end.local_name().as_ref() == "v" => break,
                             Event::Eof => {
                                 return Err(SpreadsheetError::InvalidFormat(
                                     "unterminated XLSX value".into(),
-                                ))
+                                ));
                             }
-                            _ => {}
+                            event => {
+                                let mut complete =
+                                    append_value_event(&mut self.scratch, first_event)?;
+                                if !complete {
+                                    complete = append_value_event(&mut self.scratch, event)?;
+                                }
+                                while !complete {
+                                    self.value_buf.clear();
+                                    let value_event = self
+                                        .xml
+                                        .read_event_into(&mut self.value_buf)
+                                        .map_err(|e| {
+                                            SpreadsheetError::InvalidFormat(format!(
+                                                "XLSX value XML: {e}"
+                                            ))
+                                        })?;
+                                    complete = append_value_event(&mut self.scratch, value_event)?;
+                                }
+                                value = parse_value(
+                                    self.scratch.as_bytes(),
+                                    cell_type,
+                                    style,
+                                    formats,
+                                    custom_date_formats,
+                                    uses_1904_date_system,
+                                )?;
+                            }
                         }
+                    } else {
+                        let mut complete = append_value_event(&mut self.scratch, first_event)?;
+                        while !complete {
+                            self.value_buf.clear();
+                            let value_event =
+                                self.xml.read_event_into(&mut self.value_buf).map_err(|e| {
+                                    SpreadsheetError::InvalidFormat(format!("XLSX value XML: {e}"))
+                                })?;
+                            complete = append_value_event(&mut self.scratch, value_event)?;
+                        }
+                        let parsed = parse_value(
+                            self.scratch.as_bytes(),
+                            cell_type,
+                            style,
+                            formats,
+                            custom_date_formats,
+                            uses_1904_date_system,
+                        )?;
+                        value = match parsed {
+                            ParsedCellValue::OwnedText(text) => {
+                                self.scratch = text;
+                                ParsedCellValue::ScratchText
+                            }
+                            other => other,
+                        };
                     }
-                    let parsed = parse_value(
-                        self.scratch.as_bytes(),
-                        cell_type,
-                        style,
-                        formats,
-                        custom_date_formats,
-                        uses_1904_date_system,
-                    )?;
-                    value = match parsed {
-                        ParsedCellValue::OwnedText(text) => {
-                            self.scratch = text;
-                            ParsedCellValue::ScratchText
-                        }
-                        other => other,
-                    };
                 }
                 Event::Start(element) if element.local_name().as_ref() == "is" => {
                     self.read_inline_string()?;
@@ -740,28 +853,25 @@ enum ParsedCellValue {
 }
 
 fn parse_row_number(element: &BytesStart<'_>) -> Option<u32> {
-    element
-        .attributes()
+    RawAttrIter::new(element.attributes_raw().as_bytes())
         .flatten()
-        .find(|attr| attr.key.as_ref() == "r")
-        .and_then(|attr| parse_cell_reference(attr.value.as_bytes()).map(|(row, _)| row))
+        .find(|(key, _)| *key == b"r")
+        .and_then(|(_, value)| parse_cell_reference(value).map(|(row, _)| row))
 }
 
 fn parse_cell_attributes(element: &BytesStart<'_>) -> (Option<u32>, XlsxCellType, usize) {
     let mut column = None;
     let mut cell_type = XlsxCellType::Number;
     let mut style = 0;
-    for attr in element.attributes().flatten() {
-        match attr.key.as_ref() {
-            "r" => column = parse_cell_reference(attr.value.as_bytes()).map(|(_, col)| col),
-            "s" => {
-                style = atoi_simd::parse::<usize, true, false>(attr.value.as_bytes()).unwrap_or(0)
-            }
-            "t" => {
-                cell_type = match attr.value.as_ref() {
-                    "s" => XlsxCellType::SharedString,
-                    "b" => XlsxCellType::Boolean,
-                    "inlineStr" | "inline_string" => XlsxCellType::InlineString,
+    for (key, value) in RawAttrIter::new(element.attributes_raw().as_bytes()).flatten() {
+        match key {
+            b"r" => column = parse_cell_reference(value).map(|(_, col)| col),
+            b"s" => style = atoi_simd::parse::<usize, true, false>(value).unwrap_or(0),
+            b"t" => {
+                cell_type = match value {
+                    b"s" => XlsxCellType::SharedString,
+                    b"b" => XlsxCellType::Boolean,
+                    b"inlineStr" | b"inline_string" => XlsxCellType::InlineString,
                     _ => XlsxCellType::Other,
                 }
             }
@@ -771,9 +881,88 @@ fn parse_cell_attributes(element: &BytesStart<'_>) -> (Option<u32>, XlsxCellType
     (column, cell_type, style)
 }
 
+/// Allocation-free scanner for the small set of raw XML attributes used in
+/// worksheet cell hot paths. XML tokenization has already validated quotes.
+struct RawAttrIter<'a> {
+    raw: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> RawAttrIter<'a> {
+    #[inline]
+    fn new(raw: &'a [u8]) -> Self {
+        Self { raw, pos: 0 }
+    }
+}
+
+impl<'a> Iterator for RawAttrIter<'a> {
+    type Item = Result<(&'a [u8], &'a [u8]), AttrError>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        let raw = self.raw;
+        let len = raw.len();
+        let mut pos = self.pos;
+        while pos < len && raw[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        if pos >= len {
+            self.pos = pos;
+            return None;
+        }
+
+        let key_start = pos;
+        while pos < len && raw[pos] != b'=' {
+            pos += 1;
+        }
+        if pos >= len {
+            self.pos = len;
+            return Some(Err(AttrError::ExpectedEq(key_start)));
+        }
+        let key = raw[key_start..pos].trim_ascii_end();
+        pos += 1;
+        while pos < len && raw[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        let quote = raw.get(pos).copied();
+        if quote != Some(b'"') && quote != Some(b'\'') {
+            self.pos = len;
+            return Some(Err(AttrError::UnquotedValue(pos)));
+        }
+        let quote = quote.unwrap();
+        pos += 1;
+        let value_start = pos;
+        while pos < len && raw[pos] != quote {
+            pos += 1;
+        }
+        let value = &raw[value_start..pos];
+        if pos < len {
+            pos += 1;
+        }
+        self.pos = pos;
+        Some(Ok((key, value)))
+    }
+}
+
 fn append_unescaped(scratch: &mut String, raw: &str) -> SpreadsheetResult<()> {
     scratch.push_str(raw);
     Ok(())
+}
+
+fn append_value_event(scratch: &mut String, event: Event<'_>) -> SpreadsheetResult<bool> {
+    match event {
+        Event::Text(text) => append_unescaped(scratch, text.as_ref())?,
+        Event::CData(text) => append_unescaped(scratch, text.as_ref())?,
+        Event::GeneralRef(reference) => scratch.push_str(&decode_xml_reference(reference.as_ref())),
+        Event::End(end) if end.local_name().as_ref() == "v" => return Ok(true),
+        Event::Eof => {
+            return Err(SpreadsheetError::InvalidFormat(
+                "unterminated XLSX value".into(),
+            ));
+        }
+        _ => {}
+    }
+    Ok(false)
 }
 
 fn decode_xml_reference(reference: &str) -> String {
@@ -941,6 +1130,7 @@ enum XlsxCellType {
 mod tests {
     use super::*;
     use crate::{datetime_to_excel_serial, CellValue};
+    use std::io::Cursor;
     use std::io::Write;
 
     #[test]
@@ -958,21 +1148,48 @@ mod tests {
     }
 
     #[test]
+    fn raw_cell_attrs_support_spacing_and_single_quotes() {
+        let mut reader = XmlReader::from_reader(Cursor::new(b"<c r = 'C3' s='12' t = \"b\"/>"));
+        let mut buf = Vec::new();
+        let Event::Empty(element) = reader.read_event_into(&mut buf).unwrap() else {
+            panic!("expected empty cell element");
+        };
+        assert_eq!(
+            parse_cell_attributes(&element),
+            (Some(2), XlsxCellType::Boolean, 12)
+        );
+    }
+
+    #[test]
     fn parses_date_serial_using_1904_system() {
         let expected = chrono::NaiveDate::from_ymd_opt(2025, 2, 3)
             .unwrap()
             .and_hms_opt(12, 30, 0)
             .unwrap();
         let serial = datetime_to_excel_serial(&expected, true);
-        let mut reader = XlsxReader::new();
-        reader.uses_1904_date_system = true;
-        reader.xf_id_to_num_fmt_id = vec![0, 14];
         let xml = format!(r#"<sheetData><row><c s="1"><v>{serial}</v></c></row></sheetData>"#);
         let mut row_reader = XmlReader::from_reader(BufReader::new(Cursor::new(xml.into_bytes())));
         row_reader.config_mut().trim_text(false);
-        reader.row_reader = Some(row_reader);
-        assert!(reader.read_next_row().unwrap());
-        assert_eq!(reader.current_row, vec![CellValue::DateTime(expected)]);
+        let mut row_buf = Vec::new();
+        let mut current_row = Vec::new();
+        let mut field_count = 0;
+        let formats = vec![0, 14];
+        let custom_date_formats = HashSet::new();
+        let context = XlsxParseContext {
+            shared_strings: &[],
+            formats: &formats,
+            custom_date_formats: &custom_date_formats,
+            uses_1904_date_system: true,
+        };
+        assert!(read_next_row_from(
+            &mut row_reader,
+            &mut row_buf,
+            &mut current_row,
+            &mut field_count,
+            &context,
+        )
+        .unwrap());
+        assert_eq!(current_row, vec![CellValue::DateTime(expected)]);
     }
 
     #[test]
@@ -1032,18 +1249,36 @@ mod tests {
             br#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>"#,
         )
         .unwrap();
+        zip.start_file("xl/sharedStrings.xml", options).unwrap();
+        zip.write_all(br#"<sst><si><t>shared value</t></si></sst>"#)
+            .unwrap();
         zip.start_file("xl/worksheets/sheet1.xml", options).unwrap();
         zip.write_all(
             br#"<worksheet><sheetData><row r="1"><c r="A1" t="str"><v>A&amp;B</v></c><c r="B1" t="inlineStr"><is>
   <r><t>left</t></r>
   <r><t>right&amp;</t></r>
-</is></c></row></sheetData></worksheet>"#,
+</is></c><c r="C1"><v>42.5</v></c><c r="D1" t="b"><v>1</v></c><c r="E1" t="str"><v>number&amp;text</v></c><c r="F1" t="s"><v>0</v></c></row></sheetData></worksheet>"#,
         )
         .unwrap();
         zip.finish().unwrap();
 
         let mut reader = XlsxReader::new();
-        reader.open(&path, false).unwrap();
+        reader.open(&path, true).unwrap();
+        reader.select_sheet("Data").unwrap();
+        assert!(reader.read().unwrap());
+        assert_eq!(
+            reader.current_row(),
+            &[
+                CellValue::Text("A&B".into()),
+                CellValue::Text("leftright&".into()),
+                CellValue::Number(42.5),
+                CellValue::Boolean(true),
+                CellValue::Text("number&text".into()),
+                CellValue::Text("shared value".into()),
+            ]
+        );
+        assert!(!reader.read().unwrap());
+
         let mut cells = reader.cell_reader("Data").unwrap();
         let first = cells.next_cell().unwrap().unwrap();
         assert_eq!(first.row, 0);
@@ -1052,6 +1287,18 @@ mod tests {
         let second = cells.next_cell().unwrap().unwrap();
         assert_eq!(second.column, 1);
         assert_eq!(second.value, CellValueRef::Text("leftright&"));
+        let third = cells.next_cell().unwrap().unwrap();
+        assert_eq!(third.column, 2);
+        assert_eq!(third.value, CellValueRef::Number(42.5));
+        let fourth = cells.next_cell().unwrap().unwrap();
+        assert_eq!(fourth.column, 3);
+        assert_eq!(fourth.value, CellValueRef::Boolean(true));
+        let fifth = cells.next_cell().unwrap().unwrap();
+        assert_eq!(fifth.column, 4);
+        assert_eq!(fifth.value, CellValueRef::Text("number&text"));
+        let sixth = cells.next_cell().unwrap().unwrap();
+        assert_eq!(sixth.column, 5);
+        assert_eq!(sixth.value, CellValueRef::Text("shared value"));
         assert!(cells.next_cell().unwrap().is_none());
     }
 }

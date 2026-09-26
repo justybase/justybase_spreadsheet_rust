@@ -1,6 +1,7 @@
 //! Stateful forward-only BIFF12 parser (port of `BiffReaderWriter.ts`).
 
 use std::collections::HashSet;
+use std::io::{ErrorKind, Read};
 
 use crate::error::{SpreadsheetError, SpreadsheetResult};
 use crate::formats::is_date_format_code;
@@ -14,8 +15,14 @@ pub enum BiffCellType {
     Str = 5,
 }
 
-pub struct BiffReaderWriter<'a> {
-    buffer: &'a [u8],
+enum BiffInput<'a, R> {
+    Slice(&'a [u8]),
+    Stream(R),
+}
+
+pub struct BiffReaderWriter<'a, R: Read + 'a = Box<dyn Read + 'a>> {
+    input: BiffInput<'a, R>,
+    record_buffer: Vec<u8>,
     pos: usize,
     length: usize,
 
@@ -49,10 +56,24 @@ pub struct BiffReaderWriter<'a> {
 
 impl<'a> BiffReaderWriter<'a> {
     pub fn new(buffer: &'a [u8]) -> Self {
+        Self::with_input(BiffInput::Slice(buffer), buffer.len())
+    }
+}
+
+impl<'a, R: Read + 'a> BiffReaderWriter<'a, R> {
+    /// Parse BIFF12 records incrementally from a reader, retaining only the
+    /// current record payload. The reader must already be positioned at the
+    /// first record header.
+    pub fn from_reader(reader: R) -> Self {
+        Self::with_input(BiffInput::Stream(reader), 0)
+    }
+
+    fn with_input(input: BiffInput<'a, R>, length: usize) -> Self {
         Self {
-            buffer,
+            input,
+            record_buffer: Vec::with_capacity(128),
             pos: 0,
-            length: buffer.len(),
+            length,
             is_sheet: false,
             workbook_id: 0,
             rec_id: None,
@@ -77,6 +98,14 @@ impl<'a> BiffReaderWriter<'a> {
         }
     }
 
+    #[inline]
+    fn current_buffer(&self) -> &[u8] {
+        match &self.input {
+            BiffInput::Slice(buffer) => buffer,
+            BiffInput::Stream(_) => &self.record_buffer,
+        }
+    }
+
     #[inline(always)]
     fn try_read_variable_value(&mut self) -> SpreadsheetResult<Option<u32>> {
         if self.pos >= self.length {
@@ -84,7 +113,7 @@ impl<'a> BiffReaderWriter<'a> {
         }
         let mut value = 0u32;
         for index in 0..5 {
-            let byte = *self.buffer.get(self.pos).ok_or_else(|| {
+            let byte = *self.current_buffer().get(self.pos).ok_or_else(|| {
                 SpreadsheetError::InvalidFormat("BIFF12 VLQ runs past end of buffer".into())
             })?;
             self.pos += 1;
@@ -132,35 +161,42 @@ impl<'a> BiffReaderWriter<'a> {
     #[inline(always)]
     fn get_dword(&self, offset: usize) -> SpreadsheetResult<u32> {
         let range = self.field_range(offset, 4)?;
-        Ok(u32::from_le_bytes(copy4(self.buffer, range.start)))
+        Ok(u32::from_le_bytes(copy4(
+            self.current_buffer(),
+            range.start,
+        )))
     }
 
     #[inline(always)]
     fn get_i32(&self, offset: usize) -> SpreadsheetResult<i32> {
         let range = self.field_range(offset, 4)?;
-        Ok(i32::from_le_bytes(copy4(self.buffer, range.start)))
+        Ok(i32::from_le_bytes(copy4(
+            self.current_buffer(),
+            range.start,
+        )))
     }
 
     #[inline(always)]
     fn get_word(&self, offset: usize) -> SpreadsheetResult<u16> {
         let range = self.field_range(offset, 2)?;
+        let buffer = self.current_buffer();
         Ok(u16::from_le_bytes([
-            self.buffer[range.start],
-            self.buffer[range.start + 1],
+            buffer[range.start],
+            buffer[range.start + 1],
         ]))
     }
 
     #[inline(always)]
     fn get_byte(&self, offset: usize) -> SpreadsheetResult<u8> {
         let range = self.field_range(offset, 1)?;
-        Ok(self.buffer[range.start])
+        Ok(self.current_buffer()[range.start])
     }
 
     #[inline(always)]
     fn get_double(&self, offset: usize) -> SpreadsheetResult<f64> {
         let range = self.field_range(offset, 8)?;
         let mut b = [0u8; 8];
-        b.copy_from_slice(&self.buffer[range]);
+        b.copy_from_slice(&self.current_buffer()[range]);
         Ok(f64::from_le_bytes(b))
     }
 
@@ -170,7 +206,7 @@ impl<'a> BiffReaderWriter<'a> {
             SpreadsheetError::InvalidFormat("BIFF12 string length overflows".into())
         })?;
         let range = self.field_range(offset, width)?;
-        let units = self.buffer[range]
+        let units = self.current_buffer()[range]
             .as_chunks::<2>()
             .0
             .iter()
@@ -204,6 +240,48 @@ impl<'a> BiffReaderWriter<'a> {
 
     #[inline(always)]
     fn begin_record(&mut self) -> SpreadsheetResult<Option<u32>> {
+        if matches!(&self.input, BiffInput::Stream(_)) {
+            let (record_id, record_length) = {
+                let BiffInput::Stream(reader) = &mut self.input else {
+                    unreachable!()
+                };
+                let record_id = match read_stream_vlq(reader, true)? {
+                    Some(value) => value,
+                    None => return Ok(None),
+                };
+                let record_length = read_stream_vlq(reader, false)?.ok_or_else(|| {
+                    SpreadsheetError::InvalidFormat("BIFF12 record length is truncated".into())
+                })? as usize;
+                (record_id, record_length)
+            };
+            if self.record_buffer.len() < record_length {
+                self.record_buffer
+                    .try_reserve_exact(record_length - self.record_buffer.len())
+                    .map_err(|_| {
+                        SpreadsheetError::InvalidFormat(
+                            "BIFF12 record payload is too large to buffer".into(),
+                        )
+                    })?;
+                self.record_buffer.resize(record_length, 0);
+            }
+            if let BiffInput::Stream(reader) = &mut self.input {
+                reader
+                    .read_exact(&mut self.record_buffer[..record_length])
+                    .map_err(|error| {
+                        if error.kind() == ErrorKind::UnexpectedEof {
+                            SpreadsheetError::InvalidFormat(
+                                "BIFF12 record payload is truncated".into(),
+                            )
+                        } else {
+                            error.into()
+                        }
+                    })?;
+            }
+            self.record_start = 0;
+            self.record_end = record_length;
+            return Ok(Some(record_id));
+        }
+
         let record_id = match self.try_read_variable_value()? {
             Some(value) => value,
             None => return Ok(None),
@@ -357,6 +435,46 @@ impl<'a> BiffReaderWriter<'a> {
     }
 }
 
+fn read_stream_vlq(reader: &mut dyn Read, allow_eof: bool) -> SpreadsheetResult<Option<u32>> {
+    let mut value = 0u32;
+    for index in 0..5 {
+        let mut byte = [0u8; 1];
+        if index == 0 && allow_eof {
+            match reader.read(&mut byte) {
+                Ok(0) => return Ok(None),
+                Ok(_) => {}
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            reader.read_exact(&mut byte).map_err(|error| {
+                if error.kind() == ErrorKind::UnexpectedEof {
+                    SpreadsheetError::InvalidFormat("BIFF12 VLQ is truncated".into())
+                } else {
+                    error.into()
+                }
+            })?;
+        }
+        let payload = byte[0] & 0x7f;
+        if index == 4 && payload > 0x0f {
+            return Err(SpreadsheetError::InvalidFormat(
+                "BIFF12 VLQ overflows u32".into(),
+            ));
+        }
+        if index == 4 && byte[0] & 0x80 != 0 {
+            return Err(SpreadsheetError::InvalidFormat(
+                "BIFF12 VLQ is too long".into(),
+            ));
+        }
+        value |= (payload as u32) << (index * 7);
+        if byte[0] & 0x80 == 0 {
+            return Ok(Some(value));
+        }
+    }
+    Err(SpreadsheetError::InvalidFormat(
+        "BIFF12 VLQ is too long".into(),
+    ))
+}
+
 fn copy4(buf: &[u8], at: usize) -> [u8; 4] {
     [buf[at], buf[at + 1], buf[at + 2], buf[at + 3]]
 }
@@ -365,6 +483,7 @@ fn copy4(buf: &[u8], at: usize) -> [u8; 4] {
 mod tests {
     use super::*;
     use crate::biff12::build_record;
+    use std::io::Cursor;
 
     #[test]
     fn rk_integer_decodes() {
@@ -406,5 +525,63 @@ mod tests {
         let mut r = BiffReaderWriter::new(&record);
         let error = r.read_worksheet().unwrap_err();
         assert!(matches!(error, SpreadsheetError::InvalidFormat(_)));
+    }
+
+    #[test]
+    fn stream_reader_matches_slice_reader_for_worksheet_records() {
+        let mut payload = vec![0u8; 16];
+        payload[0..4].copy_from_slice(&2u32.to_le_bytes());
+        payload[4..8].copy_from_slice(&0u32.to_le_bytes());
+        payload[8..16].copy_from_slice(&42.5f64.to_le_bytes());
+        let mut bytes = build_record(0x00, &[7u8; 25]);
+        bytes[2..6].copy_from_slice(&7i32.to_le_bytes());
+        bytes.extend(build_record(0x05, &payload));
+
+        let mut slice = BiffReaderWriter::new(&bytes);
+        let mut stream = BiffReaderWriter::from_reader(Cursor::new(bytes.clone()));
+        for _ in 0..2 {
+            assert_eq!(
+                slice.read_worksheet().unwrap(),
+                stream.read_worksheet().unwrap()
+            );
+            assert_eq!(slice.row_index, stream.row_index);
+            assert_eq!(slice.read_cell, stream.read_cell);
+            assert_eq!(slice.cell_type, stream.cell_type);
+            assert_eq!(slice.column_num, stream.column_num);
+            assert_eq!(slice.double_val, stream.double_val);
+        }
+        assert!(!slice.read_worksheet().unwrap());
+        assert!(!stream.read_worksheet().unwrap());
+    }
+
+    #[test]
+    fn stream_reader_rejects_truncated_vlq_and_record_payload() {
+        let mut truncated_vlq = BiffReaderWriter::from_reader(Cursor::new(vec![0x80]));
+        assert!(matches!(
+            truncated_vlq.read_worksheet(),
+            Err(SpreadsheetError::InvalidFormat(_))
+        ));
+
+        let bytes = build_record(0x05, &[0; 4]);
+        let mut truncated_payload = BiffReaderWriter::from_reader(Cursor::new(bytes));
+        assert!(matches!(
+            truncated_payload.read_worksheet(),
+            Err(SpreadsheetError::InvalidFormat(_))
+        ));
+    }
+
+    #[test]
+    fn stream_reader_decodes_shared_strings_without_a_part_buffer() {
+        let mut payload = vec![0u8; 11];
+        payload[1..5].copy_from_slice(&3u32.to_le_bytes());
+        for (index, unit) in ['a' as u16, 'b' as u16, 'c' as u16].into_iter().enumerate() {
+            let start = 5 + index * 2;
+            payload[start..start + 2].copy_from_slice(&unit.to_le_bytes());
+        }
+        let bytes = build_record(0x13, &payload);
+        let mut reader = BiffReaderWriter::from_reader(Cursor::new(bytes));
+        assert!(reader.read_shared_strings().unwrap());
+        assert_eq!(reader.shared_string_value.as_deref(), Some("abc"));
+        assert!(!reader.read_shared_strings().unwrap());
     }
 }

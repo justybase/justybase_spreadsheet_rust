@@ -21,6 +21,46 @@ and are not stored in this document.
 | Rust parity | `cargo run --release --example parity_bench /tmp/bench` | Rust batch/streaming writes and full reads |
 | XLSX writers | `cargo run --release --example write_comparison` | This crate against `rust_xlsxwriter` |
 | XLSB writers | `cargo run --release --example xlsb_write_comparison` | This crate against `rxlsb` and `xlsb-writer` |
+| Large reader scale | `cargo build --release --example read_scale_bench` | Large XLSX/XLSB row and cell scans against `calamine`, with checksums |
+
+The large reader harness can generate an input and measure scans at larger
+scales without building the full dataset in memory:
+
+```bash
+target/release/examples/read_scale_bench generate /tmp/read-scale 1000000
+target/release/examples/read_scale_bench scan rust-xlsx-row /tmp/read-scale/rust-1000000.xlsx 5
+target/release/examples/read_scale_bench scan calamine-xlsx-cell /tmp/read-scale/rust-1000000.xlsx 5
+```
+
+To isolate parser throughput from this crate's eager conversion of Excel date
+serials into `chrono` values, generate the equivalent workload with a numeric
+value in the date column:
+
+```bash
+target/release/examples/read_scale_bench generate /tmp/read-scale 1000000 --no-dates
+target/release/examples/read_scale_bench scan rust-xlsx-cell /tmp/read-scale/rust-1000000-no-dates.xlsx 5
+target/release/examples/read_scale_bench scan calamine-xlsx-cell /tmp/read-scale/rust-1000000-no-dates.xlsx 5
+```
+
+The no-date file has the same row/column shape and payloads, but the date
+column is a number without a date style, so both readers return a numeric cell.
+
+Supported scan modes are `rust-xlsx-row`, `rust-xlsx-cell`, `rust-xlsb-row`,
+`rust-xlsb-cell`, and the equivalent `calamine-xlsx-range`,
+`calamine-xlsx-cell`, `calamine-xlsb-range`, and `calamine-xlsb-cell` modes.
+Each timed run opens the workbook and scans the full sheet; the harness first
+does one untimed warmup scan, then checks that all measured scans return the
+same row count and checksum. For peak RSS, run one scan in a fresh process and
+repeat it three times:
+
+```bash
+/usr/bin/time -f 'peak_rss_kib=%M' \
+  target/release/examples/read_scale_bench scan rust-xlsb-cell \
+  /tmp/read-scale/rust-1000000.xlsb --once
+```
+
+Use the same generated files for every implementation being compared. A
+representative scale set is 50,000, 250,000, and 1,000,000 data rows.
 
 The comparison examples accept `[outDir] [rows] [iters] [columns]`; the XLSB
 example also accepts `[compression]`. For example, an opt-in full-size run is:
