@@ -30,7 +30,7 @@ path = "src/lib.rs"
 
 [dependencies]
 atoi_simd = "0.18"
-zip = "8"
+zip = "9"
 chrono = "0.4"
 fast-float2 = "0.2"
 quick-xml = "0.42"
