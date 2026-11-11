@@ -52,6 +52,8 @@ pub struct XlsxReader {
 
     pub xf_id_to_num_fmt_id: Vec<u16>,
     pub custom_date_formats: HashSet<u16>,
+    /// Whether each XF index uses a date number format, precomputed once.
+    date_styles: Vec<bool>,
     /// Whether the workbook uses Excel's Macintosh 1904 date system.
     pub uses_1904_date_system: bool,
 }
@@ -74,6 +76,7 @@ impl XlsxReader {
             results_count: 0,
             xf_id_to_num_fmt_id: Vec::new(),
             custom_date_formats: HashSet::new(),
+            date_styles: Vec::new(),
             uses_1904_date_system: false,
         }
     }
@@ -93,6 +96,7 @@ impl XlsxReader {
         self.results_count = 0;
         self.xf_id_to_num_fmt_id.clear();
         self.custom_date_formats.clear();
+        self.date_styles.clear();
         self.uses_1904_date_system = false;
         self.current_sheet_index = -1;
 
@@ -144,6 +148,7 @@ impl XlsxReader {
         if let Some(styles) = read_zip_entry(&mut zip, "xl/styles.xml")? {
             let xml = String::from_utf8_lossy(&styles).into_owned();
             let (xfs, customs) = parse_styles(&xml);
+            self.date_styles = build_date_styles(&xfs, &customs);
             self.xf_id_to_num_fmt_id = xfs;
             self.custom_date_formats = customs;
         }
@@ -171,21 +176,14 @@ impl XlsxReader {
             .map(|sheet| sheet.path.clone())
             .ok_or_else(|| SpreadsheetError::SheetNotFound(name.to_owned()))?;
         let shared_strings = &self.shared_strings;
-        let formats = &self.xf_id_to_num_fmt_id;
-        let custom_date_formats = &self.custom_date_formats;
+        let date_styles = &self.date_styles;
         let uses_1904_date_system = self.uses_1904_date_system;
         let zip = self
             .zip
             .as_mut()
             .ok_or_else(|| SpreadsheetError::InvalidFormat("reader is not open".into()))?;
         let entry = zip.by_name(&path)?;
-        XlsxCellReader::new(
-            entry,
-            shared_strings,
-            formats,
-            custom_date_formats,
-            uses_1904_date_system,
-        )
+        XlsxCellReader::new(entry, shared_strings, date_styles, uses_1904_date_system)
     }
 
     /// Select a worksheet by its workbook name and reset row iteration.
@@ -265,8 +263,7 @@ impl XlsxReader {
             current_row,
             field_count,
             shared_strings,
-            xf_id_to_num_fmt_id,
-            custom_date_formats,
+            date_styles,
             uses_1904_date_system,
             ..
         } = self;
@@ -275,8 +272,7 @@ impl XlsxReader {
             .ok_or_else(|| SpreadsheetError::InvalidFormat("reader is not open".into()))?;
         let context = XlsxParseContext {
             shared_strings,
-            formats: xf_id_to_num_fmt_id,
-            custom_date_formats,
+            date_styles,
             uses_1904_date_system: *uses_1904_date_system,
         };
         row_reader.with_reader_mut(|reader| {
@@ -366,8 +362,7 @@ fn read_next_row_from<R: BufRead>(
 pub struct XlsxCellReader<'a> {
     xml: XmlReader<BufReader<ZipFile<'a, File>>>,
     shared_strings: &'a [String],
-    formats: &'a [u16],
-    custom_date_formats: &'a HashSet<u16>,
+    date_styles: &'a [bool],
     uses_1904_date_system: bool,
     buf: Vec<u8>,
     cell_buf: Vec<u8>,
@@ -381,8 +376,7 @@ impl<'a> XlsxCellReader<'a> {
     fn new(
         entry: ZipFile<'a, File>,
         shared_strings: &'a [String],
-        formats: &'a [u16],
-        custom_date_formats: &'a HashSet<u16>,
+        date_styles: &'a [bool],
         uses_1904_date_system: bool,
     ) -> SpreadsheetResult<Self> {
         // Worksheet XML is read sequentially from a compressed ZIP member;
@@ -393,8 +387,7 @@ impl<'a> XlsxCellReader<'a> {
         Ok(Self {
             xml,
             shared_strings,
-            formats,
-            custom_date_formats,
+            date_styles,
             uses_1904_date_system,
             buf: Vec::with_capacity(1024),
             cell_buf: Vec::with_capacity(256),
@@ -474,8 +467,7 @@ impl<'a> XlsxCellReader<'a> {
     ) -> SpreadsheetResult<CellValueRef<'_>> {
         self.scratch.clear();
         let mut value = ParsedCellValue::Empty;
-        let formats = self.formats;
-        let custom_date_formats = self.custom_date_formats;
+        let date_styles = self.date_styles;
         let uses_1904_date_system = self.uses_1904_date_system;
         loop {
             self.cell_buf.clear();
@@ -508,8 +500,7 @@ impl<'a> XlsxCellReader<'a> {
                                     text.as_bytes(),
                                     cell_type,
                                     style,
-                                    formats,
-                                    custom_date_formats,
+                                    date_styles,
                                     uses_1904_date_system,
                                 )
                             })
@@ -521,8 +512,7 @@ impl<'a> XlsxCellReader<'a> {
                                     text.as_bytes(),
                                     cell_type,
                                     style,
-                                    formats,
-                                    custom_date_formats,
+                                    date_styles,
                                     uses_1904_date_system,
                                 )
                             })
@@ -569,8 +559,7 @@ impl<'a> XlsxCellReader<'a> {
                                     self.scratch.as_bytes(),
                                     cell_type,
                                     style,
-                                    formats,
-                                    custom_date_formats,
+                                    date_styles,
                                     uses_1904_date_system,
                                 )?;
                             }
@@ -589,8 +578,7 @@ impl<'a> XlsxCellReader<'a> {
                             self.scratch.as_bytes(),
                             cell_type,
                             style,
-                            formats,
-                            custom_date_formats,
+                            date_styles,
                             uses_1904_date_system,
                         )?;
                         value = match parsed {
@@ -687,8 +675,7 @@ impl<'a> XlsxCellReader<'a> {
 
 struct XlsxParseContext<'a> {
     shared_strings: &'a [String],
-    formats: &'a [u16],
-    custom_date_formats: &'a HashSet<u16>,
+    date_styles: &'a [bool],
     uses_1904_date_system: bool,
 }
 
@@ -738,8 +725,7 @@ fn read_owned_cell_value<R: BufRead>(
                     value_text.as_bytes(),
                     cell_type,
                     style,
-                    context.formats,
-                    context.custom_date_formats,
+                    context.date_styles,
                     context.uses_1904_date_system,
                 )?;
                 in_value = false;
@@ -801,8 +787,7 @@ fn parse_value(
     raw: &[u8],
     cell_type: XlsxCellType,
     style: usize,
-    formats: &[u16],
-    custom_date_formats: &HashSet<u16>,
+    date_styles: &[bool],
     uses_1904_date_system: bool,
 ) -> SpreadsheetResult<ParsedCellValue> {
     match cell_type {
@@ -825,12 +810,7 @@ fn parse_value(
                     ))
                 }
             };
-            if style > 0
-                && is_date_num_fmt(
-                    formats.get(style).copied().unwrap_or(0),
-                    custom_date_formats,
-                )
-            {
+            if style > 0 && date_styles.get(style).copied().unwrap_or(false) {
                 Ok(ParsedCellValue::DateTime(datetime_from_excel_serial(
                     number,
                     uses_1904_date_system,
@@ -1028,6 +1008,13 @@ fn is_date_num_fmt(id: u16, custom: &HashSet<u16>) -> bool {
     (14..=22).contains(&id) || (45..=47).contains(&id) || custom.contains(&id)
 }
 
+fn build_date_styles(formats: &[u16], custom: &HashSet<u16>) -> Vec<bool> {
+    formats
+        .iter()
+        .map(|&num_fmt_id| is_date_num_fmt(num_fmt_id, custom))
+        .collect()
+}
+
 fn parse_sheet_entries(xml: &str) -> Vec<(String, String, String)> {
     let mut reader = XmlReader::from_str(xml);
     reader.config_mut().trim_text(false);
@@ -1175,10 +1162,10 @@ mod tests {
         let mut field_count = 0;
         let formats = vec![0, 14];
         let custom_date_formats = HashSet::new();
+        let date_styles = build_date_styles(&formats, &custom_date_formats);
         let context = XlsxParseContext {
             shared_strings: &[],
-            formats: &formats,
-            custom_date_formats: &custom_date_formats,
+            date_styles: &date_styles,
             uses_1904_date_system: true,
         };
         assert!(read_next_row_from(
@@ -1203,8 +1190,7 @@ mod tests {
         };
         let context = XlsxParseContext {
             shared_strings: &[],
-            formats: &[],
-            custom_date_formats: &HashSet::new(),
+            date_styles: &[],
             uses_1904_date_system: false,
         };
         assert_eq!(

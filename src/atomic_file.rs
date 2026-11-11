@@ -165,7 +165,12 @@ pub fn write_buffer_atomically(buf: &[u8], destination_path: &Path) -> Spreadshe
                 let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(m));
             }
         }
-        // fsync the file once more via reopen for durability parity with TS
+        // fsync the file once more via reopen for durability parity with TS.
+        // Windows requires write access for FlushFileBuffers, while Unix keeps
+        // the read-only handle so a read-only destination mode still works.
+        #[cfg(windows)]
+        let f2 = fs::OpenOptions::new().write(true).open(&tmp_path)?;
+        #[cfg(not(windows))]
         let f2 = fs::OpenOptions::new().read(true).open(&tmp_path)?;
         f2.sync_all()?;
         Ok(())

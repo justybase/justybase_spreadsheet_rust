@@ -50,6 +50,8 @@ pub struct XlsbReader {
 
     pub xf_id_to_num_fmt_id: Vec<u16>,
     pub custom_date_formats: HashSet<u16>,
+    /// Whether each XF index uses a date number format, precomputed once.
+    date_styles: Vec<bool>,
     /// Whether the workbook uses Excel's Macintosh 1904 date system.
     pub uses_1904_date_system: bool,
 }
@@ -73,6 +75,7 @@ impl XlsbReader {
             results_count: 0,
             xf_id_to_num_fmt_id: Vec::new(),
             custom_date_formats: HashSet::new(),
+            date_styles: Vec::new(),
             uses_1904_date_system: false,
         }
     }
@@ -93,6 +96,7 @@ impl XlsbReader {
         self.results_count = 0;
         self.xf_id_to_num_fmt_id.clear();
         self.custom_date_formats.clear();
+        self.date_styles.clear();
         self.uses_1904_date_system = false;
         self.current_sheet_index = -1;
 
@@ -155,6 +159,8 @@ impl XlsbReader {
                 let mut reader =
                     BiffReaderWriter::from_reader(BufReader::with_capacity(16 * 1024, entry));
                 while reader.read_styles()? {}
+                self.date_styles =
+                    build_date_styles(&reader.xf_index_to_num_fmt_id, &reader.custom_num_fmts);
                 self.xf_id_to_num_fmt_id = reader.xf_index_to_num_fmt_id;
                 self.custom_date_formats = reader.custom_num_fmts;
             }
@@ -195,8 +201,7 @@ impl XlsbReader {
         XlsbCellReader::new(
             entry,
             &self.shared_strings,
-            &self.xf_id_to_num_fmt_id,
-            &self.custom_date_formats,
+            &self.date_styles,
             self.uses_1904_date_system,
         )
     }
@@ -288,9 +293,7 @@ impl XlsbReader {
                         .unwrap_or(CellValue::Empty),
                     3 => {
                         let mut v = CellValue::Number(double_val);
-                        let num_fmt_id =
-                            self.xf_id_to_num_fmt_id.get(xf_index).copied().unwrap_or(0);
-                        if is_date_num_fmt(num_fmt_id, &self.custom_date_formats) {
+                        if self.date_styles.get(xf_index).copied().unwrap_or(false) {
                             v = CellValue::DateTime(datetime_from_excel_serial(
                                 double_val,
                                 self.uses_1904_date_system,
@@ -401,6 +404,13 @@ fn is_date_num_fmt(id: u16, custom: &HashSet<u16>) -> bool {
     (14..=22).contains(&id) || (45..=47).contains(&id) || custom.contains(&id)
 }
 
+fn build_date_styles(formats: &[u16], custom: &HashSet<u16>) -> Vec<bool> {
+    formats
+        .iter()
+        .map(|&num_fmt_id| is_date_num_fmt(num_fmt_id, custom))
+        .collect()
+}
+
 fn read_zip_entry(
     zip: &mut zip::ZipArchive<File>,
     name: &str,
@@ -423,8 +433,7 @@ fn read_zip_entry(
 pub struct XlsbCellReader<'a> {
     reader: XlsbStreamParser<'a>,
     shared_strings: &'a [String],
-    formats: &'a [u16],
-    custom_date_formats: &'a HashSet<u16>,
+    date_styles: &'a [bool],
     uses_1904_date_system: bool,
     scratch: String,
     row: u32,
@@ -435,15 +444,13 @@ impl<'a> XlsbCellReader<'a> {
     fn new(
         entry: ZipFile<'a, File>,
         shared_strings: &'a [String],
-        formats: &'a [u16],
-        custom_date_formats: &'a HashSet<u16>,
+        date_styles: &'a [bool],
         uses_1904_date_system: bool,
     ) -> SpreadsheetResult<Self> {
         Ok(Self {
             reader: BiffReaderWriter::from_reader(BufReader::with_capacity(64 * 1024, entry)),
             shared_strings,
-            formats,
-            custom_date_formats,
+            date_styles,
             uses_1904_date_system,
             scratch: String::with_capacity(128),
             row: 0,
@@ -513,8 +520,7 @@ impl<'a> XlsbCellReader<'a> {
                     .map(CellValueRef::Text)
                     .unwrap_or(CellValueRef::Empty),
                 3 => {
-                    let num_fmt_id = self.formats.get(xf_index).copied().unwrap_or(0);
-                    if is_date_num_fmt(num_fmt_id, self.custom_date_formats) {
+                    if self.date_styles.get(xf_index).copied().unwrap_or(false) {
                         CellValueRef::DateTime(datetime_from_excel_serial(
                             double_val,
                             self.uses_1904_date_system,
