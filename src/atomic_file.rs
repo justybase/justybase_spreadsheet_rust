@@ -142,6 +142,8 @@ pub fn write_buffer_atomically(buf: &[u8], destination_path: &Path) -> Spreadshe
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
     let tmp_path = parent.join(format!(".{}.{}.tmp", file_name, unique_suffix()));
+    // `mode` is only consumed by the Unix `set_permissions` blocks below.
+    #[cfg_attr(not(unix), allow(unused_variables))]
     let mode = destination_mode(&target);
 
     let write_result: SpreadsheetResult<()> = (|| {

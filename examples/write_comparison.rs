@@ -234,7 +234,7 @@ fn write_rust_xlsxwriter(
 ) {
     let mut workbook = Workbook::new();
     let worksheet = if constant_memory {
-        workbook.add_worksheet_with_constant_memory()
+        workbook.add_worksheet_with_constant_memory().unwrap()
     } else {
         workbook.add_worksheet()
     };

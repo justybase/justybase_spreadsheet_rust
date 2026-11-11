@@ -340,7 +340,10 @@ fn rust_writers_are_byte_identical_to_ts() {
         let is_xlsx = ts_name.ends_with(".xlsx");
         for i in 0..ts_zip.len() {
             let mut a = ts_zip.by_index(i).unwrap();
-            let name = a.name().to_owned();
+            let name = match a.name() {
+                Ok(name) => name.into_owned(),
+                Err(_) => String::from_utf8_lossy(a.name_raw()).into_owned(),
+            };
             let mut buf_a = Vec::new();
             std::io::copy(&mut a, &mut buf_a).unwrap();
             drop(a);

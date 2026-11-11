@@ -30,7 +30,7 @@ path = "src/lib.rs"
 
 [dependencies]
 atoi_simd = "0.18"
-zip = "8"
+zip = "9"
 chrono = "0.4"
 fast-float2 = "0.2"
 quick-xml = "0.42"
@@ -50,7 +50,7 @@ arrow-schema = "53"
 # Exact pin keeps the calamine cross-check/fingerprint benchmark reproducible.
 calamine = "=0.36.1"
 criterion = "0.8"
-rust_xlsxwriter = { version = "0.99", features = ["chrono", "constant_memory"] }
+rust_xlsxwriter = { version = "0.101", features = ["chrono", "constant_memory"] }
 rxlsb = "0.3"
 tempfile = "3"
 xlsb-writer = "0.1"

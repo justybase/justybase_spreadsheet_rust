@@ -212,7 +212,10 @@ fn rewrite_zip(source: &Path, target: &Path, extra: Option<(&str, &[u8])>) {
     let mut has_extra = false;
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).unwrap();
-        let name = entry.name().to_owned();
+        let name = match entry.name() {
+            Ok(name) => name.into_owned(),
+            Err(_) => String::from_utf8_lossy(entry.name_raw()).into_owned(),
+        };
         let mut bytes = Vec::new();
         entry.read_to_end(&mut bytes).unwrap();
         drop(entry);

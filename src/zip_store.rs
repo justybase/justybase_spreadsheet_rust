@@ -35,7 +35,12 @@ impl ZipStore {
         let mut order = Vec::with_capacity(zip.len());
         for i in 0..zip.len() {
             let mut entry = zip.by_index(i)?;
-            let name = entry.name().to_owned();
+            let name = match entry.name() {
+                Ok(name) => name.into_owned(),
+                // zip 9 returns an error for entries with invalid name
+                // encodings; keep the pre-9 lossy-UTF8 behavior.
+                Err(_) => String::from_utf8_lossy(entry.name_raw()).into_owned(),
+            };
             let size = usize::try_from(entry.size()).map_err(|_| {
                 SpreadsheetError::InvalidFormat("ZIP entry is too large for this platform".into())
             })?;
